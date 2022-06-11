@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+
+declare -A FAILED_DEPLOYS
+declare -A SUCCESSFULLY_DEPLOYED
+
+update_remote_key () {
+	(ssh-keygen -R "${device_ip}" > /dev/null 2>&1 && remote_cmd 60 "${device}" ':' > /dev/null 2>&1)
+	[ "${PIPESTATUS[0]}" -eq 0 ] || return 1
+}
+
+remote_cmd () {
+	local timeout="$1"; shift
+	local device="$1"; shift
+	local cmd="$*"
+	[ -t 0 ] || cmd+=" $(cat /dev/stdin)"
+
+	timeout "$timeout" ssh -o KexAlgorithms=+diffie-hellman-group1-sha1 -o StrictHostKeyChecking=no -o ConnectTimeout=10 "${device}" "$cmd"
+}
+
+remote_copy () {
+	local timeout="$1"; shift
+	timeout "$timeout" scp -O -o KexAlgorithms=+diffie-hellman-group1-sha1 -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$1" "$2"
+}
+
+usage()
+{
+	echo "Node-exporter deployer to Raspberry Pi-enabled devices"
+	echo
+	echo "Syntax:	$0 [options] [IPs]"
+	echo "	$0 -h"
+	echo
+	echo "Options:"
+	echo "	--only-validate  Only validates Node-exporter deploy"
+	echo "	-h          Print this Help."
+	echo
+	echo "IPs: List of the IPs to access devices through SSH"
+	echo
+	echo
+}
+
+validate_node_exporter () {
+    local attempts="3"
+    local ret
+
+    while [ "$attempts" -gt "0" ]; do
+        hostname="$(remote_cmd 60 "${device}" "hostname")"
+        echo "Validating Node-exporter for hostame ${hostname} (${device_ip})."
+        curl -s "${device_ip}:9100/metrics" > /dev/null
+        ret="$?"
+        [ "${ret}" -eq 0 ] && break
+        sleep 30
+    done
+    [ "${ret}" -eq 0 ] && return 0 || return 1
+}
+
+summary () {
+    echo ""
+    echo ""
+    echo "---------SUMMARY---------"
+    echo ""
+    echo "The following devices could not be properly validated:"
+	for key in "${!FAILED_DEPLOYS[@]}"; do
+        echo -e "${key}:\t${FAILED_DEPLOYS[$key]}"
+	done
+
+    echo ""
+    echo "Node-exporter were properly deployed to the following devices:"
+	for key in "${!SUCCESSFULLY_DEPLOYED[@]}"; do
+        echo -e "${key}:\t${SUCCESSFULLY_DEPLOYED[$key]}"
+	done
+}
+
+only_validate="false"
+
+while getopts ":h:-:" option; do
+	case $option in
+        -)
+            case "${OPTARG}" in
+                only-validate)
+                    only_validate="true"
+                    echo "Operating in validation-only mode! No deploy will be done.";
+                    ;;
+                *)
+                    if [ "$OPTERR" = 1 ] && [ "${optspec:0:1}" != ":" ]; then
+                        echo "Unknown option --${OPTARG}" >&2
+                    fi
+                    ;;
+            esac;;
+		h|?)	# display Help
+			usage
+			exit
+			;;
+	esac
+done
+shift $((OPTIND-1))
+
+if [ $OPTIND -eq 1 ] && [ -z "$*" ]; then
+    usage
+    exit 1
+fi
+
+while [ "$#" -ge 1 ]; do
+    device_ip="$1"
+    device="pi@${device_ip}"
+    shift
+
+    fail_log="$(mktemp -u)"
+
+    echo "Checking connectivity with the device on ${device_ip}"
+    update_remote_key "${device_ip}" || {
+        message="Failed to access the device on ${device_ip}"
+        FAILED_DEPLOYS+=(["${device_ip}"]="${message}")
+        echo "${message}"
+        continue
+    }
+
+    if [ "${only_validate}" == false ]; then
+        home_folder="$(remote_cmd 60 "${device}" "realpath ~")"
+        destination_folder="${home_folder}/projects/node-exporter"
+        echo "Deploying node-exporter to device ${device_ip} into \"${destination_folder}\" folder"
+        remote_cmd 60 "${device}" "mkdir -p ${destination_folder}" || {
+            message="Failed to create \"${destination_folder}\" folder on device on ${device_ip}"
+            FAILED_DEPLOYS+=(["${device_ip}"]="${message}")
+            echo "${message}"
+            continue
+        }
+        remote_copy 60 "./docker-compose.yml" "${device}:${destination_folder}" || {
+            message="Failed to send docker-compose.yml file to the device on ${device_ip}"
+            FAILED_DEPLOYS+=(["${device_ip}"]="${message}")
+            echo "${message}"
+            continue
+        }
+        remote_cmd 500 "${device}" "cd ${destination_folder} && docker-compose up --detach" 2> "${fail_log}" || {
+            message="Failed to run Node-exporter on the device on ${device_ip}. Please check fail log on ${fail_log}"
+            FAILED_DEPLOYS+=(["${device_ip}"]="${message}")
+            echo "${message}"
+            continue
+        }
+    fi
+
+    if validate_node_exporter; then
+        message="Node-exporter deploy on ${device_ip} finished successfully!"
+        SUCCESSFULLY_DEPLOYED+=(["${device_ip}"]="${message}")
+        echo "${message}"
+    else
+        message="Failed to check Node-exporter deploy on ${device_ip}"
+        SUCCESSUCCESSFULLY_DEPLOYEDSFULLY_DEPLOYED+=(["${device_ip}"]="${message}")
+        echo "${message}"
+    fi
+done
+
+summary
